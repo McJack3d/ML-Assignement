@@ -11,79 +11,17 @@ from sklearn.model_selection import train_test_split, cross_val_score, KFold, Gr
 from sklearn.metrics import mean_squared_error
 
 from sklearn.linear_model import Ridge
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
 
 from sklearn.feature_selection import SelectFromModel
 from sklearn.ensemble import ExtraTreesRegressor
 
-from sklearn.ensemble import RandomForestRegressor  # <-- added
+from sklearn.ensemble import RandomForestRegressor
 
 
 # ----------------------------
-# 1) Custom cleaners (inside pipeline)
+# 1) Custom Transformers
 # ----------------------------
-class NHISCleaner(BaseEstimator, TransformerMixin):
-    """
-    - Drops survey design/weight columns (WT/PSU/STRAT/RECTYPE patterns)
-    - Drops ID-like object columns (very high cardinality)
-    - Replaces NHIS missing codes with NaN (numeric columns only)
-    """
-    def __init__(
-        self,
-        missing_codes=(7, 8, 9, 97, 98, 99, 997, 998, 999),
-        drop_patterns=("WT", "PSU", "STRAT", "RECTYPE"),
-        id_unique_ratio_threshold=0.98,
-        max_id_nunique=5000,
-        verbose=False
-    ):
-        self.missing_codes = missing_codes
-        self.drop_patterns = drop_patterns
-        self.id_unique_ratio_threshold = id_unique_ratio_threshold
-        self.max_id_nunique = max_id_nunique
-        self.verbose = verbose
-
-    def fit(self, X, y=None):
-        X = X.copy()
-
-        # Drop by name pattern
-        pattern_drop = []
-        upper_cols = {c: str(c).upper() for c in X.columns}
-        for c, cu in upper_cols.items():
-            if any(pat in cu for pat in self.drop_patterns):
-                pattern_drop.append(c)
-
-        # ID-like object columns
-        id_like = []
-        n = len(X)
-        for c in X.columns:
-            if X[c].dtype == "object":
-                nunique = X[c].nunique(dropna=True)
-                ratio = nunique / max(n, 1)
-                if (ratio >= self.id_unique_ratio_threshold) and (nunique <= self.max_id_nunique or ratio > 0.995):
-                    id_like.append(c)
-
-        self.drop_cols_ = sorted(set(pattern_drop + id_like))
-
-        if self.verbose:
-            print(f"[NHISCleaner] Dropping {len(self.drop_cols_)} columns")
-            if len(self.drop_cols_) < 50:
-                print("Dropped columns:", self.drop_cols_)
-
-        return self
-
-    def transform(self, X):
-        X = X.copy()
-
-        # Drop identified columns
-        X = X.drop(columns=self.drop_cols_, errors="ignore")
-
-        # Replace missing codes in numeric columns
-        for c in X.columns:
-            if pd.api.types.is_numeric_dtype(X[c]):
-                X[c] = X[c].replace(list(self.missing_codes), np.nan)
-
-        return X
-
 class DropAllMissing(BaseEstimator, TransformerMixin):
     """Drops columns that are entirely missing (all NaN)."""
     def fit(self, X, y=None):
@@ -102,7 +40,6 @@ def build_preprocessor():
     numeric_selector = make_column_selector(dtype_include=np.number)
     categorical_selector = make_column_selector(dtype_include=object)
 
-    # Keep pipeline compatible with sparse output from OneHotEncoder
     numeric_pipe = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler(with_mean=False)),
@@ -125,7 +62,7 @@ def build_preprocessor():
 
 
 def build_tree_feature_selector(
-    n_estimators=200,          # was 400 (cuts selector cost a lot)
+    n_estimators=200,
     max_features="sqrt",
     min_samples_leaf=2,
     threshold="median",
@@ -142,7 +79,6 @@ def build_tree_feature_selector(
 
 def build_ridge_pipeline(alpha=1000.0):
     return Pipeline(steps=[
-        ("clean", NHISCleaner(verbose=False)),
         ("drop_all_missing", DropAllMissing()),
         ("prep", build_preprocessor()),
         ("fs", build_tree_feature_selector(threshold="median")),
@@ -158,7 +94,6 @@ def build_gb_pipeline(
     subsample=0.8
 ):
     return Pipeline(steps=[
-        ("clean", NHISCleaner(verbose=False)),
         ("drop_all_missing", DropAllMissing()),
         ("prep", build_preprocessor()),
         ("fs", build_tree_feature_selector(threshold="median")),
@@ -173,6 +108,28 @@ def build_gb_pipeline(
         )),
     ])
 
+
+def build_histgb_pipeline(
+    max_iter=500,
+    learning_rate=0.05,
+    max_depth=6,
+    min_samples_leaf=20,
+    l2_regularization=1.0
+):
+    return Pipeline(steps=[
+        ("drop_all_missing", DropAllMissing()),
+        ("prep", build_preprocessor()),
+        ("model", HistGradientBoostingRegressor(
+            max_iter=max_iter,
+            learning_rate=learning_rate,
+            max_depth=max_depth,
+            min_samples_leaf=min_samples_leaf,
+            l2_regularization=l2_regularization,
+            early_stopping=True,
+            validation_fraction=0.1,
+            random_state=42
+        )),
+    ])
 
 
 # ----------------------------
@@ -209,23 +166,31 @@ if __name__ == "__main__":
 
     # List of irrelevant/redundant variables to remove
     to_drop = [
-        # Metadata and Survey Design
-        "HHX", "WTFA_A", "PPSU", "PSTRAT", "SRVY_YR", "INTV_QRT", "INTV_MON",
-        "RECTYPE", "HHRESPSA_FLG", "IMPINCFLG_A", "SDMSRSOFT_A", "SDMSRS_A",
+    # --- Metadata and Survey Design ---
+    "HHX", "WTFA_A", "PPSU", "PSTRAT", "SRVY_YR", "INTV_QRT", "INTV_MON",
+    "RECTYPE", "HHRESPSA_FLG", "IMPINCFLG_A", "SDMSRSOFT_A", "SDMSRS_A",
 
-        # Redundant Demographic Flags (Keeping AGEP_A and SEX_A instead)
-        "AGE65", "OVER65FLG_A", "MAFLG_A", "CHFLG_A",
+    # --- Redundant Demographics ---
+    # Keeping AGEP_A and SEX_A
+    "AGE65", "OVER65FLG_A", "MAFLG_A", "CHFLG_A",
 
-        # Redundant Income/Poverty (Keeping POVRATTC_A)
-        "INCGRP_A", "RATCAT_A",
+    # --- Redundant Income/Poverty ---
+    # Keeping POVRATTC_A
+    "INCGRP_A", "RATCAT_A",
 
-        # Redundant Race/Identity (Keeping HISPALLP_A and RACEALLP_A)
-        "HISP_A", "SASPPHISP_A", "SASPPRACE_A", "HISDETP_A",
+    # --- Redundant Race/Identity ---
+    # Keeping HISPALLP_A and RACEALLP_A
+    "HISP_A", "SASPPHISP_A", "SASPPRACE_A", "HISDETP_A",
 
-        # Calculated Exercise Scores (Keep PA18_02R_A, drop individual components)
-        "MODFREQW_A", "MODMIN_A", "VIGFREQW_A", "VIGMIN_A",
-        "MODNR_A", "MODTPR_A", "VIGNR_A", "VIGTPR_A",
-    ]
+    # --- Calculated Exercise Scores ---
+    # Keeping PA18_02R_A
+    "MODFREQW_A", "MODMIN_A", "VIGFREQW_A", "VIGMIN_A",
+    "MODNR_A", "MODTPR_A", "VIGNR_A", "VIGTPR_A",
+
+    # --- Target Leakage (Weight & BMI) ---
+    # NOTE: Don't drop target yet, we need it!
+    "BMICAT_A"
+]
 
     df = df.drop(columns=to_drop, errors="ignore")
     print(f"Remaining variables: {df.shape[1]}")
@@ -244,8 +209,6 @@ if __name__ == "__main__":
     # Tree-based feature selection at the beginning (Random Forest)
     # ------------------------------------------------------------
     # 1. Define your target (Y) and features (X)
-    # Replace 'WEIGHTLBTC_A' with the actual name of your target column
-    target = "WEIGHTLBTC_A"
     X = df.drop(columns=[target])
     y = df[target]
 
@@ -358,3 +321,7 @@ if __name__ == "__main__":
     # Evaluate the tuned best estimator on a holdout split
     best_gb = gb_search.best_estimator_
     evaluate_pipeline(best_gb, X, y, name="GradientBoosting (tuned, L2)")
+
+    # Base HistGB
+    histgb_pipe = build_histgb_pipeline()
+    evaluate_pipeline(histgb_pipe, X, y, name="HistGradientBoosting")
